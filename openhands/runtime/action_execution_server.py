@@ -46,6 +46,7 @@ from openhands.events.action import (
     FileReadAction,
     FileWriteAction,
     IPythonRunCellAction,
+    TaskTrackingAction,
 )
 from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
@@ -57,6 +58,7 @@ from openhands.events.observation import (
     FileWriteObservation,
     IPythonRunCellObservation,
     Observation,
+    TaskTrackingObservation,
 )
 from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
@@ -152,6 +154,14 @@ def _execute_file_editor(
     except TypeError as e:
         # Handle unexpected arguments or type errors
         return f'ERROR:\n{str(e)}', (None, None)
+    except (ValueError, IndexError, FileNotFoundError, OSError) as e:
+        # Handle file-related errors (out of range line numbers, file not found, etc.)
+        logger.error(f'File editor error for {path}: {e}')
+        return f'ERROR:\n{str(e)}', (None, None)
+    except Exception as e:
+        # Catch any other unexpected exceptions to prevent 500 errors
+        logger.error(f'Unexpected error in file editor for {path}: {e}', exc_info=True)
+        return f'ERROR:\nUnexpected error: {str(e)}', (None, None)
 
     if result.error:
         return f'ERROR:\n{result.error}', (None, None)
@@ -444,6 +454,10 @@ class ActionExecutor:
                 view_range=action.view_range,
             )
 
+            # Check if result_str indicates an error
+            if result_str and result_str.startswith('ERROR:'):
+                return ErrorObservation(result_str)
+
             return FileReadObservation(
                 content=result_str,
                 path=action.path,
@@ -603,6 +617,66 @@ class ActionExecutor:
                     new_download = True
                     self.downloaded_files.append(file)
                     break  # FIXME: assuming only one file will be downloaded for simplicity
+
+    async def task_tracking(self, action: TaskTrackingAction) -> Observation:
+        """Handle TaskTrackingAction - write or read task list from .openhands/TASKS.md"""
+        try:
+            if action.command == 'plan':
+                # Write task list to .openhands/TASKS.md
+                content = '# Task List\n\n'
+                for i, task in enumerate(action.task_list, 1):
+                    # Handle both dict and string formats
+                    if isinstance(task, dict):
+                        status_icon = {
+                            'todo': '⏳',
+                            'in_progress': '🔄',
+                            'done': '✅',
+                        }.get(task.get('status', 'todo'), '⏳')
+                        title = task.get("title", "")
+                        notes = task.get("notes", "")
+                    else:
+                        # If task is a string, use it as the title
+                        status_icon = '⏳'
+                        title = str(task)
+                        notes = ""
+                    content += f'{i}. {status_icon} {title}\n'
+                    if notes:
+                        content += f'{notes}\n'
+
+                write_obs = await self.write(
+                    FileWriteAction(path='.openhands/TASKS.md', content=content)
+                )
+                if isinstance(write_obs, ErrorObservation):
+                    return ErrorObservation(
+                        f'Failed to write task list to .openhands/TASKS.md: {write_obs.content}'
+                    )
+
+                return TaskTrackingObservation(
+                    content=f'Task list has been updated with {len(action.task_list)} items.',
+                    command=action.command,
+                    task_list=action.task_list,
+                )
+            elif action.command == 'view':
+                # Read task list from .openhands/TASKS.md
+                read_obs = await self.read(FileReadAction(path='.openhands/TASKS.md'))
+                if isinstance(read_obs, FileReadObservation):
+                    return TaskTrackingObservation(
+                        content=read_obs.content,
+                        command=action.command,
+                        task_list=[],  # Empty for view command
+                    )
+                else:
+                    # Return observation if error occurs because file might not exist yet
+                    return TaskTrackingObservation(
+                        command=action.command,
+                        task_list=[],
+                        content=f'Failed to read the task list. Error: {read_obs.content}',
+                    )
+            else:
+                return ErrorObservation(f'Unknown task_tracking command: {action.command}')
+        except Exception as e:
+            logger.error(f'Error handling task_tracking action: {e}', exc_info=True)
+            return ErrorObservation(f'Error handling task_tracking action: {str(e)}')
 
             if not new_download:
                 return browser_observation

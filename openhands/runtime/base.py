@@ -880,12 +880,23 @@ fi
                 if action.command == 'plan':
                     content = '# Task List\n\n'
                     for i, task in enumerate(action.task_list, 1):
-                        status_icon = {
-                            'todo': '⏳',
-                            'in_progress': '🔄',
-                            'done': '✅',
-                        }.get(task.get('status', 'todo'), '⏳')
-                        content += f'{i}. {status_icon} {task.get("title", "")}\n{task.get("notes", "")}\n'
+                        # Handle both dict and string formats
+                        if isinstance(task, dict):
+                            status_icon = {
+                                'todo': '⏳',
+                                'in_progress': '🔄',
+                                'done': '✅',
+                            }.get(task.get('status', 'todo'), '⏳')
+                            title = task.get("title", "")
+                            notes = task.get("notes", "")
+                        else:
+                            # If task is a string, use it as the title
+                            status_icon = '⏳'
+                            title = str(task)
+                            notes = ""
+                        content += f'{i}. {status_icon} {title}\n'
+                        if notes:
+                            content += f'{notes}\n'
                     write_obs = self.write(
                         FileWriteAction(path='.openhands/TASKS.md', content=content)
                     )

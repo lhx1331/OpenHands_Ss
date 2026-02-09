@@ -56,6 +56,7 @@ try:
             possible_class_names = [
                 f'{runtime_name.upper()}Runtime',  # E2BRuntime
                 f'{runtime_name.capitalize()}Runtime',  # E2bRuntime, DaytonaRuntime, etc.
+                'SWEBenchE2BRuntime',  # Special case for swebench_e2b
             ]
 
             runtime_class = None
