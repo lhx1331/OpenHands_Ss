@@ -32,7 +32,9 @@ from evaluation.utils.shared import (
     get_metrics,
     is_fatal_evaluation_error,
     make_metadata,
+    prepare_dataset,
     reset_logger_for_multiprocessing,
+    run_evaluation,
     update_llm_config_for_completions_logging,
 )
 from openhands.core.config import (
@@ -55,7 +57,7 @@ from openhands.utils.async_utils import call_async_from_sync
 # E2B 访问配置
 os.environ.setdefault("E2B_API_KEY", "")  # 请替换为实际 API Key
 os.environ.setdefault("E2B_API_URL", "https://sandbox.cn-sh-01.sensecoreapi.tech")
-os.environ.setdefault("E2B_WORKSPACE_ID", "01995733-e3da-7635-99ae-f1acf14364c4")
+os.environ.setdefault("E2B_WORKSPACE_ID", "")
 
 # action_execution_server 对外访问 URL 模板
 os.environ.setdefault(
@@ -234,6 +236,7 @@ def process_single_instance(
                 fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(
                     metadata.agent_class
                 ),
+                headless_mode=True,  # Explicitly set to True to prevent automatic iteration limit increases
             )
         )
 
@@ -281,6 +284,60 @@ def process_single_instance(
         error=state.last_error if state and state.last_error else None,
     )
     return output
+
+
+def get_completed_instances(output_file: str) -> set[str]:
+    """Get set of completed instance IDs from output.jsonl file."""
+    completed = set()
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        data = json.loads(line)
+                        completed.add(data.get('instance_id', ''))
+        except Exception as e:
+            logger.warning(f'Error reading output file {output_file}: {e}')
+    return completed
+
+
+def process_instance_e2b(
+    instance,
+    metadata: EvalMetadata,
+    use_mp: bool = True,
+) -> EvalOutput:
+    """Adapter function for process_single_instance to work with run_evaluation.
+
+    This function wraps process_single_instance() to match the signature expected
+    by run_evaluation(): (instance, metadata, use_mp) -> EvalOutput
+
+    Args:
+        instance: The instance row from the dataset (must have 'instance_id' column)
+        metadata: Evaluation metadata
+        use_mp: Whether multiprocessing is being used (used to determine if logger should be reset)
+
+    Returns:
+        EvalOutput from process_single_instance
+    """
+    instance_id = instance['instance_id']
+
+    # Set E2B template and instance ID for this specific instance
+    # Rule: id_docker_compatible = instance_id.replace("__", "_1776_")
+    # Template: openhands-swe-{id_docker_compatible}
+    id_docker_compatible = instance_id.replace("__", "_1776_")
+    e2b_template = f"openhands-swe-{id_docker_compatible}"
+    os.environ['E2B_TEMPLATE'] = e2b_template
+    os.environ['SWE_INSTANCE_ID'] = instance_id
+
+    # Configure per-instance logs (always set up logging, not just for multiprocessing)
+    # This ensures every instance has its own log file for easier debugging
+    log_dir = os.path.join(metadata.eval_output_dir, 'logs')
+    reset_logger_for_multiprocessing(logger, instance_id, log_dir)
+
+    logger.info(f'Using E2B template: {e2b_template} for instance: {instance_id}')
+
+    # Call the actual processing function
+    return process_single_instance(instance, metadata, instance_id)
 
 
 def main():
@@ -353,103 +410,117 @@ def main():
 
     logger.info(f'Processing {len(instance_ids)} instance(s): {instance_ids}')
 
-    # Process each instance
-    outputs = []
-    for instance_id in instance_ids:
-        logger.info(f'=' * 80)
-        logger.info(f'Processing instance: {instance_id}')
-        logger.info(f'=' * 80)
+    # Filter dataset to only include requested instances
+    instances_df = df[df['instance_id'].isin(instance_ids)].copy()
 
-        # Find the instance
-        instance_row = df[df['instance_id'] == instance_id]
-        if instance_row.empty:
+    if len(instances_df) == 0:
+        logger.error('No matching instances found in dataset')
+        sys.exit(1)
+
+    if len(instances_df) < len(instance_ids):
+        found_ids = set(instances_df['instance_id'].tolist())
+        missing_ids = set(instance_ids) - found_ids
+        logger.warning(f'Some instances not found in dataset: {missing_ids}')
+
+    # Get LLM config
+    if not args.llm_config:
+        logger.error('--llm_config is required')
+        sys.exit(1)
+
+    llm_config = get_llm_config_arg(args.llm_config)
+    if llm_config is None:
+        logger.error(f'Could not find LLM config: {args.llm_config}')
+        sys.exit(1)
+
+    llm_config.log_completions = True
+    llm_config.modify_params = False
+
+    # Get condenser config
+    condenser_name = os.environ.get('EVAL_CONDENSER')
+    if condenser_name:
+        condenser_config = get_condenser_config_arg(condenser_name)
+        if condenser_config is None:
             logger.error(
-                f'Instance {instance_id} not found in dataset {args.dataset} (split: {args.split})'
+                f'Could not find Condenser config: EVAL_CONDENSER={condenser_name}'
             )
-            continue
-
-        instance = instance_row.iloc[0]
-        logger.info(f'Found instance: {instance_id}')
-
-        # Generate E2B template name from instance_id using the conversion rule
-        # Rule: id_docker_compatible = iid.replace("__", "_1776_")
-        # Template: openhands-swe-{id_docker_compatible}
-        id_docker_compatible = instance_id.replace("__", "_1776_")
-        e2b_template = f"openhands-swe-{id_docker_compatible}"
-        os.environ['E2B_TEMPLATE'] = e2b_template
-        os.environ['SWE_INSTANCE_ID'] = instance_id  # Set for runtime to use
-        logger.info(f'Using E2B template: {e2b_template} for instance: {instance_id}')
-
-        # Get LLM config
-        if not args.llm_config:
-            logger.error('--llm_config is required')
             sys.exit(1)
-
-        llm_config = get_llm_config_arg(args.llm_config)
-        if llm_config is None:
-            logger.error(f'Could not find LLM config: {args.llm_config}')
-            sys.exit(1)
-
-        llm_config.log_completions = True
-        llm_config.modify_params = False
-
-        # Get condenser config
-        condenser_name = os.environ.get('EVAL_CONDENSER')
-        if condenser_name:
-            condenser_config = get_condenser_config_arg(condenser_name)
-            if condenser_config is None:
-                logger.error(
-                    f'Could not find Condenser config: EVAL_CONDENSER={condenser_name}'
-                )
-                sys.exit(1)
-        else:
-            condenser_config = NoOpCondenserConfig()
-            logger.debug(
-                'No Condenser config provided via EVAL_CONDENSER, using NoOpCondenser.'
-            )
-
-        # Create metadata
-        details = {'mode': 'swe'}  # Default mode
-        dataset_description = (
-            args.dataset.replace('/', '__') + '-' + args.split.replace('/', '__')
-        )
-        metadata = make_metadata(
-            llm_config,
-            dataset_description,
-            args.agent_cls,
-            args.max_iterations,
-            args.eval_note,
-            args.eval_output_dir,
-            details=details,
-            condenser_config=condenser_config,
+    else:
+        condenser_config = NoOpCondenserConfig()
+        logger.debug(
+            'No Condenser config provided via EVAL_CONDENSER, using NoOpCondenser.'
         )
 
-        # Configure per-instance logs
-        log_dir = os.path.join(metadata.eval_output_dir, 'logs')
-        reset_logger_for_multiprocessing(logger, instance_id, log_dir)
+    # Create metadata
+    details = {'mode': 'swe'}  # Default mode
+    dataset_description = (
+        args.dataset.replace('/', '__') + '-' + args.split.replace('/', '__')
+    )
+    metadata = make_metadata(
+        llm_config,
+        dataset_description,
+        args.agent_cls,
+        args.max_iterations,
+        args.eval_note,
+        args.eval_output_dir,
+        details=details,
+        condenser_config=condenser_config,
+    )
 
-        # Process the instance
-        try:
-            output = process_single_instance(instance, metadata, instance_id)
-            outputs.append(output)
+    # Prepare output file
+    output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
+    os.makedirs(metadata.eval_output_dir, exist_ok=True)
 
-            # Save output immediately after each instance
-            output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
-            os.makedirs(metadata.eval_output_dir, exist_ok=True)
+    # Prepare dataset (filter out already completed instances)
+    instances_df = prepare_dataset(
+        instances_df,
+        output_file,
+        args.eval_n_limit,
+        eval_ids=instance_ids if instance_ids else None,
+    )
 
-            with open(output_file, 'a') as f:  # Use 'a' mode to append
-                f.write(output.model_dump_json() + '\n')
+    if len(instances_df) == 0:
+        logger.info('All instances have already been completed.')
+        return
 
-            logger.info(f'Completed instance {instance_id}')
-        except Exception as e:
-            logger.error(f'Error processing instance {instance_id}: {e}', exc_info=True)
-            continue
-
+    # Print list of instances to be processed for better visibility
+    instance_list = instances_df['instance_id'].tolist()
     logger.info(f'=' * 80)
-    logger.info(f'Evaluation completed for {len(outputs)} instance(s)')
-    if outputs and args.eval_output_dir:
-        output_file = os.path.join(args.eval_output_dir, 'output.jsonl')
-        logger.info(f'Output saved to: {output_file}')
+    logger.info(f'Running evaluation for {len(instances_df)} instance(s) with {args.eval_num_workers} worker(s)')
+    logger.info(f'Instances to process: {instance_list}')
+    logger.info(f'Output file: {output_file}')
+    logger.info(f'Log directory: {os.path.join(metadata.eval_output_dir, "logs")}')
+    logger.info(f'=' * 80)
+
+    # Show completed instances before starting
+    completed_before = get_completed_instances(output_file)
+    if completed_before:
+        logger.info(f'Already completed instances ({len(completed_before)}): {sorted(completed_before)}')
+
+    # Run evaluation with parallel processing support
+    run_evaluation(
+        instances_df,
+        metadata,
+        output_file,
+        args.eval_num_workers,  # Use the --eval-num-workers parameter
+        process_instance_e2b,    # Use the adapter function
+        max_retries=5,
+        timeout_seconds=8 * 60 * 60,  # 8 hours per instance
+    )
+
+    # Show completed instances after finishing
+    completed_after = get_completed_instances(output_file)
+    newly_completed = completed_after - completed_before
+    logger.info(f'=' * 80)
+    logger.info(f'Evaluation completed')
+    logger.info(f'Total completed instances: {len(completed_after)}')
+    if newly_completed:
+        logger.info(f'Newly completed instances ({len(newly_completed)}): {sorted(newly_completed)}')
+    if instance_list:
+        remaining = set(instance_list) - completed_after
+        if remaining:
+            logger.warning(f'Remaining instances ({len(remaining)}): {sorted(remaining)}')
+    logger.info(f'Output saved to: {output_file}')
+    logger.info(f'=' * 80)
 
 
 if __name__ == '__main__':
