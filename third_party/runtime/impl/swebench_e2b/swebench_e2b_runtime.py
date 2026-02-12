@@ -212,30 +212,24 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         Docker SWE-bench runtime expects command execution to use testbed Python.
         Enforce the same requirement for E2B runtime to avoid silently falling back
         to poetry/openhands Python.
+
+        IMPORTANT: This command runs in a persistent tmux bash session shared by
+        all subsequent CmdRunAction calls.  We must NOT leave any dangerous shell
+        options (set -e / pipefail) or conda shell hooks active, because they can
+        crash the shell on the first non-zero exit code and leave the session
+        permanently stuck ("previous command is still running").
+        Only the PATH override + hash -r is applied to the main shell.
         """
         activate_cmd = (
-            "set -e; "
-            # Prefer explicit testbed python path (Docker-compatible behavior).
+            # Detect testbed python binary path.
             "if [ -x /opt/conda/envs/testbed/bin/python ]; then "
-            "export OH_TESTBED_BIN=/opt/conda/envs/testbed/bin; "
+            "export PATH=/opt/conda/envs/testbed/bin:$PATH; "
             "elif [ -x /opt/miniconda3/envs/testbed/bin/python ]; then "
-            "export OH_TESTBED_BIN=/opt/miniconda3/envs/testbed/bin; "
+            "export PATH=/opt/miniconda3/envs/testbed/bin:$PATH; "
             "else "
             "echo 'testbed python binary not found under /opt/conda or /opt/miniconda3' >&2; "
             "exit 1; "
             "fi; "
-            # Keep conda activate as a best effort for env vars, but do not rely on it.
-            "if [ -f /opt/conda/etc/profile.d/conda.sh ]; then "
-            ". /opt/conda/etc/profile.d/conda.sh; "
-            "elif [ -f /opt/miniconda3/etc/profile.d/conda.sh ]; then "
-            ". /opt/miniconda3/etc/profile.d/conda.sh; "
-            "fi; "
-            "(conda activate testbed "
-            "|| conda activate /opt/conda/envs/testbed "
-            "|| conda activate /opt/miniconda3/envs/testbed "
-            "|| true); "
-            # Force command resolution to testbed python regardless of shell activation quirks.
-            "export PATH=$OH_TESTBED_BIN:$PATH; "
             "hash -r; "
             "echo __OH_TESTBED_PY__$(python -c 'import sys; print(sys.executable)'); "
             "which python; "
@@ -246,13 +240,13 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         obs = self.run_action(action)
         if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
             raise RuntimeError(
-                f"Failed to activate conda testbed python in E2B runtime: {obs}"
+                f"Failed to set testbed python PATH in E2B runtime: {obs}"
             )
 
         output = obs.content or ""
         if "envs/testbed/bin/python" not in output:
             raise RuntimeError(
-                "Expected testbed python interpreter after conda activation, "
+                "Expected testbed python interpreter after PATH override, "
                 f"but got output: {output}"
             )
         self.log("info", f"Using testbed python for runtime commands:\n{output}")
