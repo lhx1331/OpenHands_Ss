@@ -13,8 +13,8 @@ from tenacity import retry, retry_if_exception, stop_after_delay, wait_fixed
 from openhands.core.config import OpenHandsConfig
 from openhands.core.exceptions import AgentRuntimeDisconnectedError
 from openhands.events import EventStream
-from openhands.events.action import Action
-from openhands.events.observation import Observation
+from openhands.events.action import Action, CmdRunAction
+from openhands.events.observation import CmdOutputObservation, Observation
 from openhands.integrations.provider import PROVIDER_TOKEN_TYPE
 from openhands.llm.llm_registry import LLMRegistry
 from openhands.runtime.impl.action_execution.action_execution_client import (
@@ -193,6 +193,9 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             # 4. Setup initial environment
             if not self.attach_to_existing:
                 await call_sync_from_async(self.setup_initial_env)
+                # Keep E2B command execution aligned with Docker runtime:
+                # force conda testbed python for subsequent shell commands.
+                await call_sync_from_async(self._ensure_testbed_python)
 
             self.set_runtime_status(RuntimeStatus.READY)
             self._runtime_initialized = True
@@ -202,6 +205,57 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             self.log("error", f"Failed to connect: {e}")
             self.close()
             raise
+
+    def _ensure_testbed_python(self) -> None:
+        """Force and verify testbed Python in the runtime shell session.
+
+        Docker SWE-bench runtime expects command execution to use testbed Python.
+        Enforce the same requirement for E2B runtime to avoid silently falling back
+        to poetry/openhands Python.
+        """
+        activate_cmd = (
+            "set -e; "
+            # Prefer explicit testbed python path (Docker-compatible behavior).
+            "if [ -x /opt/conda/envs/testbed/bin/python ]; then "
+            "export OH_TESTBED_BIN=/opt/conda/envs/testbed/bin; "
+            "elif [ -x /opt/miniconda3/envs/testbed/bin/python ]; then "
+            "export OH_TESTBED_BIN=/opt/miniconda3/envs/testbed/bin; "
+            "else "
+            "echo 'testbed python binary not found under /opt/conda or /opt/miniconda3' >&2; "
+            "exit 1; "
+            "fi; "
+            # Keep conda activate as a best effort for env vars, but do not rely on it.
+            "if [ -f /opt/conda/etc/profile.d/conda.sh ]; then "
+            ". /opt/conda/etc/profile.d/conda.sh; "
+            "elif [ -f /opt/miniconda3/etc/profile.d/conda.sh ]; then "
+            ". /opt/miniconda3/etc/profile.d/conda.sh; "
+            "fi; "
+            "(conda activate testbed "
+            "|| conda activate /opt/conda/envs/testbed "
+            "|| conda activate /opt/miniconda3/envs/testbed "
+            "|| true); "
+            # Force command resolution to testbed python regardless of shell activation quirks.
+            "export PATH=$OH_TESTBED_BIN:$PATH; "
+            "hash -r; "
+            "echo __OH_TESTBED_PY__$(python -c 'import sys; print(sys.executable)'); "
+            "which python; "
+            "python -V"
+        )
+        action = CmdRunAction(command=activate_cmd)
+        action.set_hard_timeout(120)
+        obs = self.run_action(action)
+        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
+            raise RuntimeError(
+                f"Failed to activate conda testbed python in E2B runtime: {obs}"
+            )
+
+        output = obs.content or ""
+        if "envs/testbed/bin/python" not in output:
+            raise RuntimeError(
+                "Expected testbed python interpreter after conda activation, "
+                f"but got output: {output}"
+            )
+        self.log("info", f"Using testbed python for runtime commands:\n{output}")
 
     def _create_sandbox(self) -> None:
         """Create the E2B sandbox."""
