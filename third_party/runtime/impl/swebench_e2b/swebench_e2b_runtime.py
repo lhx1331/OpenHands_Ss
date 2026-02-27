@@ -311,9 +311,13 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
 
         # Build the full command - use same format as Docker runtime for consistency
         # Use -m module import (like Docker) instead of file path
+        # Allow host to override the no-change timeout (default 10s) so long-running
+        # commands like pytest have more time before the shell returns a timeout observation.
+        no_change_timeout = os.getenv("NO_CHANGE_TIMEOUT_SECONDS", "10")
         startup_cmd = (
             f"cd /openhands/code && "
             f"export PYTHONPATH=/openhands/code:$PYTHONPATH && "
+            f"export NO_CHANGE_TIMEOUT_SECONDS={no_change_timeout} && "
             f"nohup /openhands/micromamba/bin/micromamba run -n openhands poetry run python -u "
             f"-m openhands.runtime.action_execution_server "
             f"{self._server_port} "
