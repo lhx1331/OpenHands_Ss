@@ -353,7 +353,7 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         stop=stop_after_delay(180),  # Allow up to 3 minutes for server startup (includes poetry warmup)
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
-        wait=wait_fixed(3),  # Check every 3 seconds
+        wait=wait_fixed(10),  # Check every 10 seconds (reduced frequency to avoid overloading E2B gateway under concurrency)
     )
     def wait_until_alive(self) -> None:
         """Wait for action_execution_server to be ready.
