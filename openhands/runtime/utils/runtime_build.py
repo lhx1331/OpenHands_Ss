@@ -33,6 +33,8 @@ def _generate_dockerfile(
     build_from: BuildFromImageType = BuildFromImageType.SCRATCH,
     extra_deps: str | None = None,
     enable_browser: bool = True,
+    enable_vscode: bool = True,
+    deps_image: str | None = None,
 ) -> str:
     """Generate the Dockerfile content for the runtime image based on the base image.
 
@@ -41,6 +43,8 @@ def _generate_dockerfile(
     - build_from (BuildFromImageType): The build method for the runtime image.
     - extra_deps (str):
     - enable_browser (bool): Whether to enable browser support (install Playwright)
+    - enable_vscode (bool): Whether to install VSCode Server (openvscode-server)
+    - deps_image (str): Pre-built deps image to COPY from (skips poetry install)
 
     Returns:
     - str: The resulting Dockerfile content
@@ -50,8 +54,8 @@ def _generate_dockerfile(
             searchpath=os.path.join(os.path.dirname(__file__), 'runtime_templates')
         )
     )
-    template = env.get_template('Dockerfile.j2')
 
+<<<<<<< Updated upstream
     dockerfile_content = template.render(
         base_image=base_image,
         build_from_scratch=build_from == BuildFromImageType.SCRATCH,
@@ -59,6 +63,25 @@ def _generate_dockerfile(
         extra_deps=extra_deps if extra_deps is not None else '',
         enable_browser=enable_browser,
     )
+=======
+    if deps_image:
+        template = env.get_template('Dockerfile.deps.j2')
+        dockerfile_content = template.render(
+            base_image=base_image,
+            deps_image=deps_image,
+            extra_deps=extra_deps if extra_deps is not None else '',
+        )
+    else:
+        template = env.get_template('Dockerfile.j2')
+        dockerfile_content = template.render(
+            base_image=base_image,
+            build_from_scratch=build_from == BuildFromImageType.SCRATCH,
+            build_from_versioned=build_from == BuildFromImageType.VERSIONED,
+            extra_deps=extra_deps if extra_deps is not None else '',
+            enable_browser=enable_browser,
+            enable_vscode=enable_vscode,
+        )
+>>>>>>> Stashed changes
     return dockerfile_content
 
 
@@ -115,6 +138,8 @@ def build_runtime_image(
     force_rebuild: bool = False,
     extra_build_args: list[str] | None = None,
     enable_browser: bool = True,
+    enable_vscode: bool = True,
+    deps_image: str | None = None,
 ) -> str:
     """Prepares the final docker build folder.
 
@@ -130,6 +155,7 @@ def build_runtime_image(
     - force_rebuild (bool): if True, it will create the Dockerfile which uses the base_image
     - extra_build_args (List[str]): Additional build arguments to pass to the builder
     - enable_browser (bool): Whether to enable browser support (install Playwright)
+    - enable_vscode (bool): Whether to install VSCode Server (openvscode-server)
 
     Returns:
     - str: <image_repo>:<MD5 hash>. Where MD5 hash is the hash of the docker build folder
@@ -148,6 +174,8 @@ def build_runtime_image(
                 platform=platform,
                 extra_build_args=extra_build_args,
                 enable_browser=enable_browser,
+                enable_vscode=enable_vscode,
+                deps_image=deps_image,
             )
             return result
 
@@ -161,6 +189,8 @@ def build_runtime_image(
         platform=platform,
         extra_build_args=extra_build_args,
         enable_browser=enable_browser,
+        enable_vscode=enable_vscode,
+        deps_image=deps_image,
     )
     return result
 
@@ -175,9 +205,15 @@ def build_runtime_image_in_folder(
     platform: str | None = None,
     extra_build_args: list[str] | None = None,
     enable_browser: bool = True,
+    enable_vscode: bool = True,
+    deps_image: str | None = None,
 ) -> str:
     runtime_image_repo, _ = get_runtime_image_repo_and_tag(base_image)
+<<<<<<< Updated upstream
     lock_tag = f'oh_v{oh_version}_{get_hash_for_lock_files(base_image, enable_browser)}'
+=======
+    lock_tag = f'oh_v{oh_version}_{get_hash_for_lock_files(base_image, enable_browser, enable_vscode)}'
+>>>>>>> Stashed changes
     versioned_tag = (
         # truncate the base image to 96 characters to fit in the tag max length (128 characters)
         f'oh_v{oh_version}_{get_tag_for_versioned_image(base_image)}'
@@ -197,6 +233,8 @@ def build_runtime_image_in_folder(
             build_from=BuildFromImageType.SCRATCH,
             extra_deps=extra_deps,
             enable_browser=enable_browser,
+            enable_vscode=enable_vscode,
+            deps_image=deps_image,
         )
         if not dry_run:
             _build_sandbox_image(
@@ -235,7 +273,7 @@ def build_runtime_image_in_folder(
     else:
         logger.debug(f'Build [{hash_image_name}] from scratch')
 
-    prep_build_folder(build_folder, base_image, build_from, extra_deps, enable_browser)
+    prep_build_folder(build_folder, base_image, build_from, extra_deps, enable_browser, enable_vscode, deps_image=deps_image)
     if not dry_run:
         _build_sandbox_image(
             build_folder,
@@ -261,6 +299,8 @@ def prep_build_folder(
     build_from: BuildFromImageType,
     extra_deps: str | None,
     enable_browser: bool = True,
+    enable_vscode: bool = True,
+    deps_image: str | None = None,
 ) -> None:
     # Copy the source code to directory. It will end up in build_folder/code
     # If package is not found, build from source code
@@ -298,6 +338,8 @@ def prep_build_folder(
         build_from=build_from,
         extra_deps=extra_deps,
         enable_browser=enable_browser,
+        enable_vscode=enable_vscode,
+        deps_image=deps_image,
     )
     dockerfile_path = Path(build_folder, 'Dockerfile')
     with open(str(dockerfile_path), 'w') as f:
@@ -317,13 +359,16 @@ def truncate_hash(hash: str) -> str:
     return ''.join(result)
 
 
-def get_hash_for_lock_files(base_image: str, enable_browser: bool = True) -> str:
+def get_hash_for_lock_files(base_image: str, enable_browser: bool = True, enable_vscode: bool = True) -> str:
     openhands_source_dir = Path(openhands.__file__).parent
     md5 = hashlib.md5()
     md5.update(base_image.encode())
     # Only include enable_browser in hash when it's False for backward compatibility
     if not enable_browser:
         md5.update(str(enable_browser).encode())
+    # Only include enable_vscode in hash when it's False for backward compatibility
+    if not enable_vscode:
+        md5.update(str(enable_vscode).encode())
     for file in ['pyproject.toml', 'poetry.lock']:
         src = Path(openhands_source_dir, file)
         if not src.exists():
@@ -401,7 +446,21 @@ if __name__ == '__main__':
     parser.add_argument(
         '--no_enable_browser', dest='enable_browser', action='store_false'
     )
-    args = parser.parse_args()
+    parser.add_argument('--enable_vscode', action='store_true', default=True)
+    parser.add_argument(
+        '--no_enable_vscode', dest='enable_vscode', action='store_false'
+    )
+    parser.add_argument(
+        '--deps_image', type=str, default=None,
+        help='Pre-built deps image to COPY from (skips poetry install for faster builds)',
+    )
+    # Use parse_known_args so that any unrecognized arguments (e.g. --build-arg, --network=host)
+    # are automatically captured and passed through to docker build as extra_build_args.
+    args, extra_build_args = parser.parse_known_args()
+    args.extra_build_args = extra_build_args if extra_build_args else None
+
+    if args.extra_build_args:
+        logger.debug(f'Extra docker build args: {args.extra_build_args}')
 
     if args.build_folder is not None:
         # If a build_folder is provided, we do not actually build the Docker image. We copy the necessary source code
@@ -432,7 +491,10 @@ if __name__ == '__main__':
                 dry_run=True,
                 force_rebuild=args.force_rebuild,
                 platform=args.platform,
+                extra_build_args=args.extra_build_args,
                 enable_browser=args.enable_browser,
+                enable_vscode=args.enable_vscode,
+                deps_image=args.deps_image,
             )
 
             _runtime_image_repo, runtime_image_source_tag = (
@@ -471,6 +533,9 @@ if __name__ == '__main__':
             args.base_image,
             docker_builder,
             platform=args.platform,
+            extra_build_args=args.extra_build_args,
             enable_browser=args.enable_browser,
+            enable_vscode=args.enable_vscode,
+            deps_image=args.deps_image,
         )
         logger.debug(f'\nBuilt image: {image_name}\n')

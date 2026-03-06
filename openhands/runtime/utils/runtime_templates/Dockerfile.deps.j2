@@ -1,0 +1,81 @@
+FROM {{ deps_image }} AS openhands-deps
+FROM {{ base_image }}
+
+SHELL ["/bin/bash", "-c"]
+
+ARG PIP_INDEX_URL=""
+ARG PIP_TRUSTED_HOST=""
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY=""
+ARG http_proxy=""
+ARG https_proxy=""
+ARG no_proxy=""
+
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    http_proxy=${http_proxy:-${HTTP_PROXY}} \
+    https_proxy=${https_proxy:-${HTTPS_PROXY}} \
+    no_proxy=${no_proxy:-${NO_PROXY}}
+
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
+
+ENV POETRY_VIRTUALENVS_PATH=/openhands/poetry \
+    MAMBA_ROOT_PREFIX=/openhands/micromamba \
+    POETRY_HTTP_TIMEOUT=300 \
+    POETRY_REQUESTS_TIMEOUT=300 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    EDITOR=code \
+    VISUAL=code \
+    GIT_EDITOR="code --wait" \
+    OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
+
+# ================================================================
+# Install system dependencies
+# ================================================================
+{% if (('ubuntu' not in base_image) and ('mswebench' not in base_image)) %}
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wget curl ca-certificates sudo apt-utils git jq tmux build-essential ripgrep ffmpeg \
+        libgl1-mesa-glx \
+        libasound2-plugins libatomic1 \
+        apt-transport-https ca-certificates curl gnupg lsb-release && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+{% endif %}
+
+RUN (if getent passwd 1000 | grep -q pn; then userdel pn; fi) && \
+    (if getent passwd 1000 | grep -q ubuntu; then userdel ubuntu; fi)
+
+# ================================================================
+# COPY pre-built openhands environment from deps image
+# ================================================================
+COPY --from=openhands-deps /openhands/micromamba /openhands/micromamba
+COPY --from=openhands-deps /openhands/poetry /openhands/poetry
+COPY --from=openhands-deps /openhands/bin /openhands/bin
+
+ENV PATH="/openhands/bin:${PATH}"
+
+RUN mkdir -p /openhands/logs /openhands/code/openhands /openhands/workspace && \
+    touch /openhands/code/openhands/__init__.py && \
+    git config --global user.name "openhands" && \
+    git config --global user.email "openhands@all-hands.dev"
+
+WORKDIR /openhands/code
+COPY ./code/pyproject.toml ./code/poetry.lock /openhands/code/
+
+RUN /openhands/micromamba/bin/micromamba run -n openhands poetry run python -c \
+        "import sys; print('OH_INTERPRETER_PATH=' + sys.executable)" >> /etc/environment && \
+    chmod -R g+rws /openhands/poetry && \
+    chmod -R g+rws,o+rw /openhands/workspace
+
+# ================================================================
+# Copy Project source files
+# ================================================================
+COPY ./code/microagents /openhands/code/microagents
+COPY ./code/openhands /openhands/code/openhands
+RUN chmod a+rwx /openhands/code/openhands/__init__.py
+
+{% if extra_deps %}RUN {{ extra_deps }} {% endif %}
