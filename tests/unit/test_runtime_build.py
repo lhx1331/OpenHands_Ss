@@ -136,6 +136,31 @@ def test_get_hash_for_lock_files_different_enable_browser():
         assert hash_true != hash_false  # They should be different
 
 
+def test_get_hash_for_lock_files_different_enable_vscode():
+    with patch('builtins.open', mock_open(read_data='mock-data'.encode())):
+        hash_true = get_hash_for_lock_files('some_base_image', enable_browser=True, enable_vscode=True)
+        hash_false = get_hash_for_lock_files('some_base_image', enable_browser=True, enable_vscode=False)
+
+        # Hash with enable_vscode=True should not include the enable_vscode value (backward compat)
+        md5_true = hashlib.md5()
+        md5_true.update('some_base_image'.encode())
+        for _ in range(2):
+            md5_true.update('mock-data'.encode())
+        expected_hash_true = truncate_hash(md5_true.hexdigest())
+
+        # Hash with enable_vscode=False should include the enable_vscode value
+        md5_false = hashlib.md5()
+        md5_false.update('some_base_image'.encode())
+        md5_false.update('False'.encode())  # enable_vscode=False is included
+        for _ in range(2):
+            md5_false.update('mock-data'.encode())
+        expected_hash_false = truncate_hash(md5_false.hexdigest())
+
+        assert hash_true == expected_hash_true
+        assert hash_false == expected_hash_false
+        assert hash_true != hash_false  # They should be different
+
+
 def test_get_hash_for_source_files():
     dirhash_mock = MagicMock()
     dirhash_mock.return_value = '1f69bd20d68d9e3874d5bf7f7459709b'
@@ -209,6 +234,48 @@ def test_generate_dockerfile_build_from_versioned():
     assert 'COPY ./code/openhands /openhands/code/openhands' in dockerfile_content
 
 
+def test_generate_dockerfile_with_deps_image():
+    base_image = 'debian:11'
+    deps_image = 'my-deps:latest'
+    dockerfile_content = _generate_dockerfile(
+        base_image,
+        build_from=BuildFromImageType.SCRATCH,
+        deps_image=deps_image,
+    )
+    # Should use multi-stage build from deps image
+    assert f'FROM {deps_image} AS openhands-deps' in dockerfile_content
+    assert f'FROM {base_image}' in dockerfile_content
+    # Should COPY pre-built directories from deps
+    assert 'COPY --from=openhands-deps /openhands/micromamba /openhands/micromamba' in dockerfile_content
+    assert 'COPY --from=openhands-deps /openhands/poetry /openhands/poetry' in dockerfile_content
+    assert 'COPY --from=openhands-deps /openhands/bin /openhands/bin' in dockerfile_content
+    # Should NOT install dependencies from scratch
+    assert 'poetry install' not in dockerfile_content
+    assert 'micro.mamba.pm' not in dockerfile_content
+
+
+def test_generate_dockerfile_no_vscode():
+    base_image = 'debian:11'
+    dockerfile_content = _generate_dockerfile(
+        base_image,
+        build_from=BuildFromImageType.SCRATCH,
+        enable_vscode=False,
+    )
+    # Should NOT install VSCode server
+    assert 'openvscode-server' not in dockerfile_content
+
+
+def test_generate_dockerfile_with_vscode():
+    base_image = 'debian:11'
+    dockerfile_content = _generate_dockerfile(
+        base_image,
+        build_from=BuildFromImageType.SCRATCH,
+        enable_vscode=True,
+    )
+    # Should install VSCode server
+    assert 'openvscode-server' in dockerfile_content
+
+
 def test_get_runtime_image_repo_and_tag_eventstream():
     base_image = 'debian:11'
     img_repo, img_tag = get_runtime_image_repo_and_tag(base_image)
@@ -272,7 +339,7 @@ def test_build_runtime_image_from_scratch():
             == f'{get_runtime_image_repo()}:{OH_VERSION}_mock-lock-tag_mock-source-tag'
         )
         mock_prep_build_folder.assert_called_once_with(
-            ANY, base_image, BuildFromImageType.SCRATCH, None, True
+            ANY, base_image, BuildFromImageType.SCRATCH, None, True, True, deps_image=None
         )
 
 
@@ -368,6 +435,8 @@ def test_build_runtime_image_exact_hash_not_exist_and_lock_exist():
             BuildFromImageType.LOCK,
             None,
             True,
+            True,
+            deps_image=None,
         )
 
 
@@ -428,6 +497,8 @@ def test_build_runtime_image_exact_hash_not_exist_and_lock_not_exist_and_version
             BuildFromImageType.VERSIONED,
             None,
             True,
+            True,
+            deps_image=None,
         )
 
 

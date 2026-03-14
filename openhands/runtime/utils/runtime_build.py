@@ -55,15 +55,6 @@ def _generate_dockerfile(
         )
     )
 
-<<<<<<< Updated upstream
-    dockerfile_content = template.render(
-        base_image=base_image,
-        build_from_scratch=build_from == BuildFromImageType.SCRATCH,
-        build_from_versioned=build_from == BuildFromImageType.VERSIONED,
-        extra_deps=extra_deps if extra_deps is not None else '',
-        enable_browser=enable_browser,
-    )
-=======
     if deps_image:
         template = env.get_template('Dockerfile.deps.j2')
         dockerfile_content = template.render(
@@ -81,7 +72,6 @@ def _generate_dockerfile(
             enable_browser=enable_browser,
             enable_vscode=enable_vscode,
         )
->>>>>>> Stashed changes
     return dockerfile_content
 
 
@@ -209,11 +199,7 @@ def build_runtime_image_in_folder(
     deps_image: str | None = None,
 ) -> str:
     runtime_image_repo, _ = get_runtime_image_repo_and_tag(base_image)
-<<<<<<< Updated upstream
-    lock_tag = f'oh_v{oh_version}_{get_hash_for_lock_files(base_image, enable_browser)}'
-=======
     lock_tag = f'oh_v{oh_version}_{get_hash_for_lock_files(base_image, enable_browser, enable_vscode)}'
->>>>>>> Stashed changes
     versioned_tag = (
         # truncate the base image to 96 characters to fit in the tag max length (128 characters)
         f'oh_v{oh_version}_{get_tag_for_versioned_image(base_image)}'

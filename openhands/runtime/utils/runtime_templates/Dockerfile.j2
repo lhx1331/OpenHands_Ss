@@ -9,8 +9,11 @@ ENV POETRY_VIRTUALENVS_PATH=/openhands/poetry \
     LC_ALL=C.UTF-8 \
     EDITOR=code \
     VISUAL=code \
-    GIT_EDITOR="code --wait" \
-    OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
+    GIT_EDITOR="code --wait"
+
+{% if enable_vscode %}
+ENV OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
+{% endif %}
 
 {% macro setup_base_system() %}
 
@@ -229,7 +232,9 @@ COPY ./code/pyproject.toml ./code/poetry.lock /openhands/code/
 # ================================================================
 {% endif %}
 
+{% if enable_vscode %}
 {{ setup_vscode_server() }}
+{% endif %}
 
 # ================================================================
 # Copy Project source files
@@ -248,7 +253,9 @@ RUN chmod a+rwx /openhands/code/openhands/__init__.py
 # ================================================================
 {% if build_from_versioned %}
 {{ install_dependencies() }}
+{% if enable_vscode %}
 {{ install_vscode_extensions() }}
+{% endif %}
 {% endif %}
 
 # Install extra dependencies if specified
