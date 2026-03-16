@@ -5,10 +5,24 @@ action_execution_server via HTTP REST API, similar to Docker Runtime.
 """
 
 import os
+import time
 from typing import Callable
 
 import httpx
-from tenacity import retry, retry_if_exception, stop_after_delay, wait_fixed
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_delay,
+    wait_exponential,
+    wait_random,
+)
+
+# Module-level semaphore to limit concurrent sandbox creation.
+# Prevents "thundering herd" when many workers start at once.
+import threading
+
+_SANDBOX_CREATE_SEMAPHORE_SIZE = int(os.getenv("E2B_MAX_CONCURRENT_CREATES", "8"))
+_sandbox_create_semaphore = threading.Semaphore(_SANDBOX_CREATE_SEMAPHORE_SIZE)
 
 from openhands.core.config import OpenHandsConfig
 from openhands.core.exceptions import AgentRuntimeDisconnectedError
@@ -102,6 +116,11 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         self.sandbox: SWEBenchSandbox | None = None
         self._server_port = 3000
         self._server_url: str | None = None
+
+        # Throttle diagnostic API calls to avoid overloading E2B gateway under concurrency.
+        # _log_server_status_on_failure will skip if called within this interval.
+        self._diag_last_time: float = 0.0
+        self._diag_min_interval: float = 30.0  # seconds between diagnostic calls
 
         # Configure session headers for action_execution_server calls via the public E2B gateway.
         # In SenseCore's E2B gateway, auth can be required for ALL non-/alive endpoints.
@@ -203,6 +222,9 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
 
         except Exception as e:
             self.log("error", f"Failed to connect: {e}")
+            # Force a final diagnostic dump (bypass throttle) so we always
+            # have server status in the log when startup fails.
+            self._log_server_status_on_failure(log_level="error", force=True)
             self.close()
             raise
 
@@ -252,7 +274,15 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         self.log("info", f"Using testbed python for runtime commands:\n{output}")
 
     def _create_sandbox(self) -> None:
-        """Create the E2B sandbox."""
+        """Create the E2B sandbox.
+
+        Uses a module-level semaphore to limit how many sandboxes are
+        created concurrently.  This prevents a "thundering herd" of
+        simultaneous API calls when many workers start at once, which
+        can overwhelm the E2B platform and cause 504/500 timeouts.
+        The concurrency limit defaults to 8 and can be tuned via the
+        ``E2B_MAX_CONCURRENT_CREATES`` environment variable.
+        """
         template = self._get_e2b_template_name()
         workspace_id = os.getenv("E2B_WORKSPACE_ID")
 
@@ -275,7 +305,12 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             workspace_id=workspace_id,
             sandbox_timeout=sandbox_timeout,
         )
-        self.sandbox.create()
+
+        # Rate-limit concurrent sandbox creation to avoid overwhelming E2B platform.
+        self.log("debug", f"Waiting for sandbox creation slot (max {_SANDBOX_CREATE_SEMAPHORE_SIZE} concurrent)...")
+        with _sandbox_create_semaphore:
+            self.log("debug", "Acquired sandbox creation slot")
+            self.sandbox.create()
 
         self.log("info", f"Created E2B sandbox: {self.sandbox.sandbox_id}")
 
@@ -350,16 +385,18 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         # No need for fixed sleep here
 
     @retry(
-        stop=stop_after_delay(180),  # Allow up to 3 minutes for server startup (includes poetry warmup)
+        stop=stop_after_delay(240),  # Allow up to 4 minutes for server startup (extra headroom under concurrency)
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
-        wait=wait_fixed(10),  # Check every 10 seconds (reduced frequency to avoid overloading E2B gateway under concurrency)
+        wait=wait_exponential(multiplier=2, min=5, max=30) + wait_random(0, 5),  # Exponential backoff + jitter to spread requests
     )
     def wait_until_alive(self) -> None:
         """Wait for action_execution_server to be ready.
 
         Uses retry logic to poll the /alive endpoint until the server responds.
-        This is more efficient than fixed sleep as it returns as soon as server is ready.
+        Exponential backoff with random jitter prevents multiple workers from
+        sending health-check requests at the same instant (thundering herd).
+        Diagnostic API calls are throttled to avoid overloading the E2B gateway.
         """
         if self.sandbox is None:
             raise AgentRuntimeDisconnectedError("Sandbox not initialized")
@@ -373,18 +410,46 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             self.check_if_alive()
             self.log("debug", "action_execution_server is alive")
         except Exception as e:
-            # On failure, try to get server logs for debugging
+            # On failure, try to get server logs for debugging (throttled).
+            # Diagnostic calls are rate-limited to _diag_min_interval seconds
+            # to avoid overwhelming the E2B gateway under concurrency.
             self._log_server_status_on_failure(log_level="warning")
             raise
 
-    def _log_server_status_on_failure(self, log_level: str = "warning") -> None:
+    def check_if_alive(self) -> None:
+        """Override parent to use a longer timeout for E2B.
+
+        The default 5s timeout is too short when the E2B gateway is under
+        heavy load from concurrent sandbox operations.  Increasing to 15s
+        gives the gateway enough headroom to proxy the simple GET /alive
+        request even when many workers are active simultaneously.
+        """
+        response = self._send_action_server_request(
+            'GET',
+            f'{self.action_execution_server_url}/alive',
+            timeout=15,
+        )
+        assert response.is_closed
+
+    def _log_server_status_on_failure(self, log_level: str = "warning", force: bool = False) -> None:
         """Log server status and logs when health check fails or 500 error occurs.
+
+        Throttled to avoid overloading the E2B gateway under high concurrency.
+        Diagnostic calls are skipped if invoked within ``_diag_min_interval`` seconds
+        of the previous call, unless ``force=True``.
 
         Args:
             log_level: Log level to use ("error", "warning", or "debug")
+            force: If True, bypass the throttle (used for final failure).
         """
         if self.sandbox is None:
             return
+
+        now = time.time()
+        if not force and (now - self._diag_last_time) < self._diag_min_interval:
+            self.log("debug", "Skipping diagnostic API calls (throttled)")
+            return
+        self._diag_last_time = now
 
         try:
             # Check if server process is running
@@ -447,63 +512,88 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         self.log("info", "SWE-bench E2B Runtime closed")
 
     def send_action_for_execution(self, action: Action) -> Observation:
-        """Override to add better error handling for 500 errors.
+        """Override to add better error handling for 500/502 errors.
 
-        When action_execution_server returns 500, we fetch server logs
-        to help diagnose the issue.
+        - 502 Bad Gateway is retried up to 2 times (transient gateway errors).
+        - 500 Internal Server Error triggers diagnostic log collection.
         """
-        try:
-            # Defensive: ensure we always send gateway auth headers for every action request.
-            self._ensure_gateway_auth_headers()
-            # Log every action sent to /execute_action so we can see successful ones as well.
+        max_502_retries = 2
+        last_exception: Exception | None = None
+
+        for attempt in range(max_502_retries + 1):
             try:
-                self.log("info", f"EXECUTE_ACTION request: {action}", extra={"msg_type": "ACTION"})
-            except Exception:
-                # Logging should never break execution
-                pass
-
-            obs = super().send_action_for_execution(action)
-
-            # Log the corresponding observation (truncate to avoid huge logs)
-            try:
-                obs_str = str(obs)
-                if len(obs_str) > 2000:
-                    obs_str = obs_str[:2000] + "... [truncated]"
-                self.log("info", f"EXECUTE_ACTION response: {obs_str}", extra={"msg_type": "OBSERVATION"})
-            except Exception:
-                pass
-
-            return obs
-        except RequestHTTPError as e:
-            # If it's a 500 error, get server logs for debugging
-            if e.response is not None and e.response.status_code == 500:
-                # Log the action that caused the error
-                action_str = str(action)
-                if hasattr(action, 'command'):
-                    action_str = f"{action_str}\nCommand: {action.command[:500]}"  # Limit length
-                self.log("error", f"Server returned 500 error for action: {action_str}")
-                self.log("error", f"Server error: {e}")
-                if e.detail:
-                    self.log("error", f"Server error detail: {e.detail}")
-                # Log whether gateway auth headers are present (helps debug intermittent auth failures)
+                # Defensive: ensure we always send gateway auth headers for every action request.
+                self._ensure_gateway_auth_headers()
+                # Log every action sent to /execute_action so we can see successful ones as well.
                 try:
-                    auth_present = bool(self.session.headers.get("Authorization"))
-                    x_api_key_present = bool(self.session.headers.get("X-API-Key"))
-                    self.log(
-                        "error",
-                        f"Gateway auth headers present? Authorization={auth_present}, X-API-Key={x_api_key_present}",
-                    )
+                    self.log("info", f"EXECUTE_ACTION request: {action}", extra={"msg_type": "ACTION"})
+                except Exception:
+                    # Logging should never break execution
+                    pass
+
+                obs = super().send_action_for_execution(action)
+
+                # Log the corresponding observation (truncate to avoid huge logs)
+                try:
+                    obs_str = str(obs)
+                    if len(obs_str) > 2000:
+                        obs_str = obs_str[:2000] + "... [truncated]"
+                    self.log("info", f"EXECUTE_ACTION response: {obs_str}", extra={"msg_type": "OBSERVATION"})
                 except Exception:
                     pass
-                # Log raw response text (usually contains traceback from action_execution_server)
-                try:
-                    resp_text = e.response.text
-                    if resp_text:
-                        self.log("error", f"Server raw response (truncated):\n{resp_text[:4000]}")
-                except Exception as _:
-                    # Avoid masking original error if response body can't be read
-                    pass
-                # Get server logs and status with error level
-                self._log_server_status_on_failure(log_level="error")
-            raise
+
+                return obs
+            except RequestHTTPError as e:
+                last_exception = e
+                status_code = e.response.status_code if e.response is not None else None
+
+                # 502 Bad Gateway — retry (transient gateway overload)
+                if status_code == 502 and attempt < max_502_retries:
+                    wait_secs = 5 * (attempt + 1)
+                    self.log(
+                        "warning",
+                        f"Got 502 Bad Gateway (attempt {attempt + 1}/{max_502_retries + 1}), "
+                        f"retrying in {wait_secs}s...",
+                    )
+                    time.sleep(wait_secs)
+                    continue
+
+                # If it's a 500 error, get server logs for debugging
+                if status_code == 500:
+                    # Log the action that caused the error
+                    action_str = str(action)
+                    if hasattr(action, 'command'):
+                        action_str = f"{action_str}\nCommand: {action.command[:500]}"  # Limit length
+                    self.log("error", f"Server returned 500 error for action: {action_str}")
+                    self.log("error", f"Server error: {e}")
+                    if e.detail:
+                        self.log("error", f"Server error detail: {e.detail}")
+                    # Log whether gateway auth headers are present (helps debug intermittent auth failures)
+                    try:
+                        auth_present = bool(self.session.headers.get("Authorization"))
+                        x_api_key_present = bool(self.session.headers.get("X-API-Key"))
+                        self.log(
+                            "error",
+                            f"Gateway auth headers present? Authorization={auth_present}, X-API-Key={x_api_key_present}",
+                        )
+                    except Exception:
+                        pass
+                    # Log raw response text (usually contains traceback from action_execution_server)
+                    try:
+                        resp_text = e.response.text
+                        if resp_text:
+                            self.log("error", f"Server raw response (truncated):\n{resp_text[:4000]}")
+                    except Exception as _:
+                        # Avoid masking original error if response body can't be read
+                        pass
+                    # Get server logs and status with error level
+                    self._log_server_status_on_failure(log_level="error", force=True)
+
+                # 502 exhausted all retries — log before raising
+                if status_code == 502:
+                    self.log(
+                        "error",
+                        f"502 Bad Gateway persisted after {max_502_retries + 1} attempts",
+                    )
+                raise
 
