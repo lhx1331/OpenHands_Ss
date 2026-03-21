@@ -582,7 +582,14 @@ fi
             f'Attempting to list files in {source_description} microagents directory: {microagents_dir}',
         )
 
-        files = self.list_files(str(microagents_dir))
+        try:
+            files = self.list_files(str(microagents_dir))
+        except TimeoutError:
+            self.log(
+                'warning',
+                f'Timed out listing {source_description} microagents directory: {microagents_dir}, skipping',
+            )
+            return loaded_microagents
 
         if not files:
             self.log(

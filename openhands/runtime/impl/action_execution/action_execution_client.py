@@ -136,7 +136,7 @@ class ActionExecutionClient(Runtime):
         )
         assert response.is_closed
 
-    def list_files(self, path: str | None = None) -> list[str]:
+    def list_files(self, path: str | None = None, timeout: int = 30) -> list[str]:
         """List files in the sandbox.
 
         If path is None, list files in the sandbox's initial working directory (e.g., /workspace).
@@ -150,7 +150,7 @@ class ActionExecutionClient(Runtime):
                 'POST',
                 f'{self.action_execution_server_url}/list_files',
                 json=data,
-                timeout=10,
+                timeout=timeout,
             )
             assert response.is_closed
             response_json = response.json()
