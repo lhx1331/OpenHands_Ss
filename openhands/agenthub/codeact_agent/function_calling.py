@@ -56,22 +56,35 @@ def combine_thought(action: Action, thought: str) -> Action:
 
 import re
 
-_NOOP_WRAPPER_RE = re.compile(
-    r'^:\s*(?P<q>["\'])(?P<cmd>.+)(?P=q)\s*$', re.DOTALL
-)
-
 
 def _sanitize_command(command: str) -> str:
-    """Strip bash no-op wrapper that some models emit.
+    """Strip bash no-op prefix that some models emit.
 
-    Patterns handled:
-      ': "actual command"'  ->  'actual command'
-      ': '                  ->  ''  (remains empty, will be caught elsewhere)
+    Some models (e.g. Kimi K2.5) wrap real commands with a leading `:`
+    (bash no-op), causing them to silently do nothing or hang on
+    unmatched quotes.  We strip the `:` prefix and any surrounding
+    quotes so the actual command executes.
+
+    Examples:
+      ': "grep -r foo ."'           ->  'grep -r foo .'
+      ': "grep -n \\"bar\\" f.py'   ->  'grep -n \\"bar\\" f.py'
+      ': '                          ->  ': '   (no real content, leave as-is)
+      'ls -la'                      ->  'ls -la'
     """
-    m = _NOOP_WRAPPER_RE.match(command.strip())
-    if m:
-        return m.group('cmd')
-    return command
+    stripped = command.strip()
+    if not re.match(r'^:\s', stripped):
+        return command
+    inner = re.sub(r'^:\s+', '', stripped)
+    if not inner:
+        return command
+    # Remove balanced surrounding quotes
+    if (inner.startswith('"') and inner.endswith('"')) or \
+       (inner.startswith("'") and inner.endswith("'")):
+        inner = inner[1:-1]
+    # Remove unmatched leading quote
+    elif inner.startswith('"') or inner.startswith("'"):
+        inner = inner[1:]
+    return inner
 
 
 def response_to_actions(
