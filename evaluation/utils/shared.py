@@ -54,6 +54,8 @@ class EvalMetadata(BaseModel):
     details: dict[str, Any] | None = None
     condenser_config: CondenserConfig | None = None
     instruction_template_name: str | None = None
+    # Path used to resolve [llm.*] groups (e.g. draft_editor) in evaluation harnesses
+    config_file: str = 'config.toml'
 
 
 class EvalOutput(BaseModel):
@@ -172,6 +174,7 @@ def make_metadata(
     details: dict[str, Any] | None = None,
     agent_config: AgentConfig | None = None,
     condenser_config: CondenserConfig | None = None,
+    config_file: str = 'config.toml',
 ) -> EvalMetadata:
     model_name = llm_config.model.split('/')[-1]
     model_path = model_name.replace(':', '_').replace('@', '-')
@@ -207,6 +210,7 @@ def make_metadata(
         if condenser_config
         else NoOpCondenserConfig(),
         instruction_template_name=os.environ.get('INSTRUCTION_TEMPLATE_NAME'),
+        config_file=config_file,
     )
     metadata_json = metadata.model_dump_json()
     logger.info(f'Metadata: {metadata_json}')

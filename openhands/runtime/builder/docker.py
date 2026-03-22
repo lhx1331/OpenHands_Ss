@@ -173,6 +173,8 @@ class DockerRuntimeBuilder(RuntimeBuilder):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
+                encoding='utf-8',
+                errors='replace',  # Replace invalid characters instead of raising error
                 bufsize=1,
             )
 

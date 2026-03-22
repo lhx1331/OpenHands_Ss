@@ -219,6 +219,21 @@ correct_num = 5
 api_key = ""
 model = "gpt-4o"
 
+# SenseCore 商汤 nova 等 OpenAI-compatible 接口（示例：Kimi K2.5）。
+# 运行评估时: poetry run python ... --llm-config kimi_k25
+# api_key 可写在文件中，或仅设置环境变量 OPENAI_API_KEY（与 LiteLLM/OpenAI 约定一致）。
+#[llm.kimi_k25]
+#model = "openai/kimi-k2.5"
+#api_key = ""
+#base_url = "https://api.stage.sensenova.cn/compatible-mode/v2"
+#max_output_tokens = 16384
+# kimi-k2.5 locks temperature=0.6 and top_p=0.95; other values are rejected
+#temperature = 0.6
+#top_p = 0.95
+#drop_params = false
+# Vendor-specific fields passed via extra_body (bypasses OpenAI SDK validation)
+#litellm_kwargs = { extra_body = { thinking = { type = "disabled" } } }
+
 
 #################################### Agent ###################################
 # Configuration for agents (group name starts with 'agent')

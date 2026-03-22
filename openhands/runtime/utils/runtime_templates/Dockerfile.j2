@@ -18,6 +18,7 @@ ENV POETRY_VIRTUALENVS_PATH=/openhands/poetry \
 
 {% if (('ubuntu' in base_image) or ('mswebench' in base_image)) %}
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         wget curl ca-certificates sudo apt-utils git jq tmux build-essential ripgrep ffmpeg \
         {%- if (base_image.endswith(':latest') or base_image.endswith(':24.04') or ('mswebench' in base_image)) -%}
@@ -39,6 +40,7 @@ RUN apt-get update && \
 
 {% if (('ubuntu' not in base_image) and ('mswebench' not in base_image)) %}
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         wget curl ca-certificates sudo apt-utils git jq tmux build-essential ripgrep ffmpeg \
         libgl1-mesa-glx \

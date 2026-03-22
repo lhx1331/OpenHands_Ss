@@ -447,7 +447,21 @@ def complete_runtime(
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
+    try:
+        obs = runtime.run_action(action)
+    except Exception as e:
+        # If cd fails, check if directory exists
+        logger.error(f"Failed to cd to /workspace/{workspace_dir_name}: {e}")
+        # Try to check directory status
+        check_cmd = f'ls -la /workspace/ && echo "---" && if [ -d /workspace/{workspace_dir_name} ]; then echo "Directory exists"; ls -la /workspace/{workspace_dir_name}/ | head -5; else echo "Directory NOT found"; fi'
+        try:
+            check_action = CmdRunAction(command=check_cmd)
+            check_action.set_hard_timeout(30)
+            check_obs = runtime.run_action(check_action)
+            logger.error(f"Directory check result: {check_obs.content}")
+        except Exception as check_e:
+            logger.error(f"Could not check directory status: {check_e}")
+        raise
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
     if obs.exit_code == -1:
@@ -480,10 +494,28 @@ def complete_runtime(
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
-    )
+    # Check if cd was successful
+    if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
+        # Log detailed error information
+        logger.error(f'Failed to cd to /workspace/{workspace_dir_name}')
+        logger.error(f'Observation: {obs}')
+        logger.error(f'Exit code: {obs.exit_code if isinstance(obs, CmdOutputObservation) else "N/A"}')
+        logger.error(f'Content: {obs.content if isinstance(obs, CmdOutputObservation) else "N/A"}')
+
+        # Try to check if directory exists
+        check_dir_cmd = f'ls -la /workspace/ && echo "---" && if [ -d /workspace/{workspace_dir_name} ]; then echo "Directory EXISTS"; ls -la /workspace/{workspace_dir_name}/ | head -5; else echo "Directory NOT FOUND"; fi'
+        try:
+            check_action = CmdRunAction(command=check_dir_cmd)
+            check_action.set_hard_timeout(30)
+            check_obs = runtime.run_action(check_action)
+            logger.error(f'Directory check result: {check_obs.content if isinstance(check_obs, CmdOutputObservation) else str(check_obs)}')
+        except Exception as check_e:
+            logger.error(f'Could not check directory status: {check_e}')
+
+        assert_and_raise(
+            False,
+            f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
+        )
 
     action = CmdRunAction(command='git config --global core.pager ""')
     action.set_hard_timeout(600)
@@ -544,9 +576,10 @@ def complete_runtime(
 
     n_retries = 0
     git_patch = None
+    diff_base = instance["base_commit"]
     while n_retries < 5:
         action = CmdRunAction(
-            command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
+            command=f'git diff --no-color --cached {diff_base} > patch.diff'
         )
         action.set_hard_timeout(max(300 + 100 * n_retries, 600))
         logger.info(action, extra={'msg_type': 'ACTION'})
@@ -578,7 +611,14 @@ def complete_runtime(
                 else:
                     assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
             else:
-                logger.info('Failed to get git diff, retrying...')
+                if 'bad object' in str(obs.content) and diff_base != 'HEAD':
+                    logger.info(
+                        f'Base commit {diff_base} not found in history '
+                        f'(squashed repo), falling back to HEAD'
+                    )
+                    diff_base = 'HEAD'
+                else:
+                    logger.info('Failed to get git diff, retrying...')
                 sleep_if_should_continue(10)
         elif isinstance(obs, ErrorObservation):
             logger.error(f'Error occurred: {obs.content}. Retrying...')

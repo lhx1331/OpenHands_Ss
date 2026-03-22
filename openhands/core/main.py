@@ -188,7 +188,11 @@ async def run_controller(
         )
     else:
         # init with the provided actions
+        logger.info(
+            f'Adding initial user action to event stream: {type(initial_user_action).__name__}'
+        )
         event_stream.add_event(initial_user_action, EventSource.USER)
+        logger.info('Initial user action added, waiting for agent to process...')
 
     def on_event(event: Event) -> None:
         if isinstance(event, AgentStateChangedObservation):

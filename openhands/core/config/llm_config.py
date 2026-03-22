@@ -46,6 +46,8 @@ class LLMConfig(BaseModel):
         reasoning_effort: The effort to put into reasoning. This is a string that can be one of 'low', 'medium', 'high', or 'none'. Can apply to all reasoning models.
         seed: The seed to use for the LLM.
         safety_settings: Safety settings for models that support them (like Mistral AI and Gemini).
+        litellm_kwargs: Extra keyword arguments merged into every LiteLLM completion call
+            (e.g. OpenAI-compatible extensions like ``thinking`` for Kimi K2.5).
     """
 
     model: str = Field(default='claude-sonnet-4-20250514')
@@ -91,6 +93,10 @@ class LLMConfig(BaseModel):
     safety_settings: list[dict[str, str]] | None = Field(
         default=None,
         description='Safety settings for models that support them (like Mistral AI and Gemini)',
+    )
+    litellm_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description='Merged into litellm completion calls (provider-specific params)',
     )
 
     model_config = ConfigDict(extra='forbid')
@@ -157,12 +163,26 @@ class LLMConfig(BaseModel):
 
         return llm_mapping
 
+    @staticmethod
+    def _deep_to_dict(obj: Any) -> Any:
+        """Recursively convert mapping-like objects to plain dicts (pickle-safe)."""
+        if isinstance(obj, dict):
+            return {k: LLMConfig._deep_to_dict(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [LLMConfig._deep_to_dict(v) for v in obj]
+        return obj
+
     def model_post_init(self, __context: Any) -> None:
         """Post-initialization hook to assign OpenRouter-related variables to environment variables.
 
         This ensures that these values are accessible to litellm at runtime.
         """
         super().model_post_init(__context)
+
+        # TOML inline tables are parsed as DynamicInlineTableDict which is not
+        # pickle-safe; normalise to plain dicts so multiprocessing works.
+        if self.litellm_kwargs is not None:
+            self.litellm_kwargs = self._deep_to_dict(self.litellm_kwargs)
 
         # Assign OpenRouter-specific variables to environment variables
         if self.openrouter_site_url:

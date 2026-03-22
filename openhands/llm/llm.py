@@ -92,6 +92,7 @@ FUNCTION_CALLING_SUPPORTED_MODELS = [
     'gpt-4.1',
     'kimi-k2-0711-preview',
     'kimi-k2-instruct',
+    'kimi-k2.5',
     'Qwen3-Coder-480B-A35B-Instruct',
     'qwen3-coder',  # this will match both qwen3-coder-480b (openhands provider) and qwen3-coder (for openrouter)
     'gpt-5',
@@ -239,6 +240,9 @@ class LLM(RetryMixin, DebugMixin):
         elif 'gemini' in self.config.model.lower() and self.config.safety_settings:
             kwargs['safety_settings'] = self.config.safety_settings
 
+        if self.config.litellm_kwargs:
+            kwargs.update(self.config.litellm_kwargs)
+
         self._completion = partial(
             litellm_completion,
             model=self.config.model,
@@ -341,9 +345,19 @@ class LLM(RetryMixin, DebugMixin):
             # NOTE: this setting is global; unlike drop_params, it cannot be overridden in the litellm completion partial
             litellm.modify_params = self.config.modify_params
 
-            # if we're not using litellm proxy, remove the extra_body
+            # For non-proxy models, replace the agent's internal extra_body
+            # (which carries proxy metadata) with the user-configured one
+            # from litellm_kwargs. This is necessary because call-time kwargs
+            # override partial kwargs for the same key in functools.partial.
             if 'litellm_proxy' not in self.config.model:
                 kwargs.pop('extra_body', None)
+                user_extra_body = (
+                    self.config.litellm_kwargs.get('extra_body')
+                    if self.config.litellm_kwargs
+                    else None
+                )
+                if user_extra_body:
+                    kwargs['extra_body'] = user_extra_body
 
             # Record start time for latency measurement
             start_time = time.time()
@@ -848,7 +862,7 @@ class LLM(RetryMixin, DebugMixin):
             message.function_calling_enabled = self.is_function_calling_active()
             if 'deepseek' in self.config.model:
                 message.force_string_serializer = True
-            if 'kimi-k2-instruct' in self.config.model and 'groq' in self.config.model:
+            if 'kimi' in self.config.model.lower():
                 message.force_string_serializer = True
             if 'openrouter/anthropic/claude-sonnet-4' in self.config.model:
                 message.force_string_serializer = True
