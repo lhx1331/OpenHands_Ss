@@ -54,6 +54,26 @@ def combine_thought(action: Action, thought: str) -> Action:
     return action
 
 
+import re
+
+_NOOP_WRAPPER_RE = re.compile(
+    r'^:\s*(?P<q>["\'])(?P<cmd>.+)(?P=q)\s*$', re.DOTALL
+)
+
+
+def _sanitize_command(command: str) -> str:
+    """Strip bash no-op wrapper that some models emit.
+
+    Patterns handled:
+      ': "actual command"'  ->  'actual command'
+      ': '                  ->  ''  (remains empty, will be caught elsewhere)
+    """
+    m = _NOOP_WRAPPER_RE.match(command.strip())
+    if m:
+        return m.group('cmd')
+    return command
+
+
 def response_to_actions(
     response: ModelResponse, mcp_tool_names: list[str] | None = None
 ) -> list[Action]:
@@ -93,7 +113,9 @@ def response_to_actions(
                     )
                 # convert is_input to boolean
                 is_input = arguments.get('is_input', 'false') == 'true'
-                action = CmdRunAction(command=arguments['command'], is_input=is_input)
+                command = arguments['command']
+                command = _sanitize_command(command)
+                action = CmdRunAction(command=command, is_input=is_input)
 
                 # Set hard timeout if provided
                 if 'timeout' in arguments:
