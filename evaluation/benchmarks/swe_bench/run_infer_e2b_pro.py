@@ -323,17 +323,12 @@ def process_instance_e2b(
     """
     instance_id = instance['instance_id']
 
-    # Set E2B template and instance ID for this specific instance
-    # If E2B_TEMPLATE is already set externally (e.g. for shortened template names),
-    # respect that value instead of overriding it.
-    # Rule: id_docker_compatible = instance_id.replace("__", "_1776_")
-    # Template: openhands-swe-{id_docker_compatible}
-    if not os.getenv('E2B_TEMPLATE'):
-        id_docker_compatible = instance_id.replace("__", "_1776_")
-        e2b_template = f"openhands-swe-{id_docker_compatible}"
-        os.environ['E2B_TEMPLATE'] = e2b_template
-    else:
-        e2b_template = os.environ['E2B_TEMPLATE']
+    # Set E2B template and instance ID for this specific instance.
+    # Each instance MUST get its own template; os.environ is shared across
+    # workers in the same process, so we always overwrite here.
+    id_docker_compatible = instance_id.replace("__", "_1776_")
+    e2b_template = f"openhands-swe-{id_docker_compatible}"
+    os.environ['E2B_TEMPLATE'] = e2b_template
     os.environ['SWE_INSTANCE_ID'] = instance_id
 
     # Configure per-instance logs (always set up logging, not just for multiprocessing)
