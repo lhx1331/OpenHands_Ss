@@ -13,8 +13,7 @@ from tenacity import (
     retry,
     retry_if_exception,
     stop_after_delay,
-    wait_exponential,
-    wait_random,
+    wait_fixed,
 )
 
 # Module-level semaphore to limit concurrent sandbox creation.
@@ -23,6 +22,18 @@ import threading
 
 _SANDBOX_CREATE_SEMAPHORE_SIZE = int(os.getenv("E2B_MAX_CONCURRENT_CREATES", "8"))
 _sandbox_create_semaphore = threading.Semaphore(_SANDBOX_CREATE_SEMAPHORE_SIZE)
+
+# GET /alive per-request timeout (httpx read timeout). Logged each attempt.
+_ALIVE_HTTP_TIMEOUT_SEC = 60
+
+# After firing nohup startup, wait this long before the first GET /alive.
+_ACTION_SERVER_START_GRACE_SEC = 60
+
+# Between failed /alive polls (tenacity wait between retries).
+_ALIVE_POLL_INTERVAL_SEC = 15
+
+# Wall-clock budget for wait_until_alive() tenacity loop (from first check_if_alive entry).
+_WAIT_UNTIL_ALIVE_MAX_DELAY_SEC = 480
 
 from openhands.core.config import OpenHandsConfig
 from openhands.core.exceptions import AgentRuntimeDisconnectedError
@@ -200,20 +211,25 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         self.set_runtime_status(RuntimeStatus.STARTING_RUNTIME)
 
         try:
-            # 1. Create sandbox
             await call_sync_from_async(self._create_sandbox)
-
-            # 2. Start action_execution_server
             await call_sync_from_async(self._start_action_execution_server)
+        except Exception as e:
+            self.log("error", f"Failed to connect (sandbox or action server start): {e}")
+            self._log_server_status_on_failure(log_level="error", force=True)
+            self.close()
+            raise
 
-            # 3. Wait for server to be ready
+        try:
             await call_sync_from_async(self.wait_until_alive)
+        except Exception as e:
+            self.log("error", f"Failed to connect (action server not alive): {e}")
+            self._log_server_status_on_failure(log_level="error", force=True)
+            self.close()
+            raise
 
-            # 4. Setup initial environment
+        try:
             if not self.attach_to_existing:
                 await call_sync_from_async(self.setup_initial_env)
-                # Keep E2B command execution aligned with Docker runtime:
-                # force conda testbed python for subsequent shell commands.
                 await call_sync_from_async(self._ensure_testbed_python)
 
             self.set_runtime_status(RuntimeStatus.READY)
@@ -221,9 +237,7 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             self.log("info", f"SWE-bench E2B Runtime ready at {self.action_execution_server_url}")
 
         except Exception as e:
-            self.log("error", f"Failed to connect: {e}")
-            # Force a final diagnostic dump (bypass throttle) so we always
-            # have server status in the log when startup fails.
+            self.log("error", f"Failed to connect (post-alive setup): {e}")
             self._log_server_status_on_failure(log_level="error", force=True)
             self.close()
             raise
@@ -307,9 +321,14 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         )
 
         # Rate-limit concurrent sandbox creation to avoid overwhelming E2B platform.
-        self.log("debug", f"Waiting for sandbox creation slot (max {_SANDBOX_CREATE_SEMAPHORE_SIZE} concurrent)...")
+        # INFO so per-instance log files show queueing (otherwise it looks stuck after
+        # "Creating E2B sandbox" when many workers contend for few slots).
+        self.log(
+            "info",
+            f"Waiting for sandbox creation slot (max {_SANDBOX_CREATE_SEMAPHORE_SIZE} concurrent)...",
+        )
         with _sandbox_create_semaphore:
-            self.log("debug", "Acquired sandbox creation slot")
+            self.log("info", "Acquired sandbox creation slot; calling E2B create()...")
             self.sandbox.create()
 
         self.log("info", f"Created E2B sandbox: {self.sandbox.sandbox_id}")
@@ -323,7 +342,9 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
         3. Port is a positional argument, not --port
         4. SWE-bench images have UID 1000 taken by 'nonroot' user, so use that
 
-        Optimization: Instead of fixed sleep, we poll the /alive endpoint.
+        After submitting the background start command, waits
+        ``_ACTION_SERVER_START_GRACE_SEC`` before connect() proceeds to poll /alive
+        (see ``wait_until_alive`` for poll interval).
         """
         if self.sandbox is None:
             raise RuntimeError("Sandbox not created")
@@ -381,22 +402,26 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             # Log but don't fail - server may still have started
             self.log("debug", f"Execute command exception: {e}")
 
-        # Server startup is handled by wait_until_alive() with retry logic
-        # No need for fixed sleep here
+        self.log(
+            "info",
+            f"Waiting {_ACTION_SERVER_START_GRACE_SEC}s before first GET /alive "
+            f"(action server startup grace)...",
+        )
+        time.sleep(_ACTION_SERVER_START_GRACE_SEC)
 
     @retry(
-        stop=stop_after_delay(240),  # Allow up to 4 minutes for server startup (extra headroom under concurrency)
+        stop=stop_after_delay(_WAIT_UNTIL_ALIVE_MAX_DELAY_SEC),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
-        wait=wait_exponential(multiplier=2, min=5, max=30) + wait_random(0, 5),  # Exponential backoff + jitter to spread requests
+        wait=wait_fixed(_ALIVE_POLL_INTERVAL_SEC),
     )
     def wait_until_alive(self) -> None:
         """Wait for action_execution_server to be ready.
 
-        Uses retry logic to poll the /alive endpoint until the server responds.
-        Exponential backoff with random jitter prevents multiple workers from
-        sending health-check requests at the same instant (thundering herd).
-        Diagnostic API calls are throttled to avoid overloading the E2B gateway.
+        Polls GET /alive every ``_ALIVE_POLL_INTERVAL_SEC`` after a failure (first
+        attempt runs right after ``_ACTION_SERVER_START_GRACE_SEC`` in
+        ``_start_action_execution_server``). Each GET uses ``_ALIVE_HTTP_TIMEOUT_SEC``
+        and logs round-trip time.
         """
         if self.sandbox is None:
             raise AgentRuntimeDisconnectedError("Sandbox not initialized")
@@ -417,17 +442,27 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
             raise
 
     def check_if_alive(self) -> None:
-        """Override parent to use a longer timeout for E2B.
-
-        The default 5s timeout is too short when the E2B gateway is under
-        heavy load from concurrent sandbox operations.  Increasing to 15s
-        gives the gateway enough headroom to proxy the simple GET /alive
-        request even when many workers are active simultaneously.
-        """
-        response = self._send_action_server_request(
-            'GET',
-            f'{self.action_execution_server_url}/alive',
-            timeout=15,
+        """Override parent to use a longer timeout for E2B and log round-trip time."""
+        url = f'{self.action_execution_server_url}/alive'
+        t0 = time.perf_counter()
+        try:
+            response = self._send_action_server_request(
+                'GET',
+                url,
+                timeout=_ALIVE_HTTP_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            self.log(
+                'warning',
+                f'GET /alive failed after {elapsed:.2f}s '
+                f'(timeout={_ALIVE_HTTP_TIMEOUT_SEC}s): {type(e).__name__}: {e}',
+            )
+            raise
+        elapsed = time.perf_counter() - t0
+        self.log(
+            'info',
+            f'GET /alive OK in {elapsed:.2f}s (timeout={_ALIVE_HTTP_TIMEOUT_SEC}s, status={response.status_code})',
         )
         assert response.is_closed
 
@@ -447,7 +482,12 @@ class SWEBenchE2BRuntime(ActionExecutionClient):
 
         now = time.time()
         if not force and (now - self._diag_last_time) < self._diag_min_interval:
-            self.log("debug", "Skipping diagnostic API calls (throttled)")
+            # Instance logs use INFO file level; DEBUG would be invisible during /alive retries.
+            self.log(
+                "info",
+                "Alive check failed; full sandbox diagnostics throttled "
+                f"(min interval {self._diag_min_interval:.0f}s). Will dump ps/logs on next window or final failure.",
+            )
             return
         self._diag_last_time = now
 
